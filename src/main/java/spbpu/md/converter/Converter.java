@@ -19,18 +19,20 @@ public class Converter {
 
     private final Path _originalPath;
     private final Path _resultPath;
-    private final PrefixConstructor _prefixCtor;
     private final boolean _flatten;
     private final boolean _pathLine;
     private final boolean _indexFile;
+    private final PrefixConstructor prefixCtor;
+    private final ErrorReporter errorReporter = new ErrorReporter();
 
     /**
      * Constructor for converting input object (folder or <i>csv</i> file).
+     *
      * @param originalPath path to the object to be converted
-     * @param resultPath path to result folder (./result by default)
-     * @param flatten ignoring indexing files in result folder in one layer
-     * @param pathLine ignoring generation of index file
-     * @param indexFile ignoring adding relative path in first line
+     * @param resultPath   path to result folder (./result by default)
+     * @param flatten      ignoring indexing files in result folder in one layer
+     * @param pathLine     ignoring generation of index file
+     * @param indexFile    ignoring adding relative path in first line
      * @throws IOException if it was not possible to create a folder for the result
      */
     public Converter(String originalPath, String resultPath, boolean flatten, boolean pathLine, boolean indexFile) throws IOException {
@@ -40,7 +42,7 @@ public class Converter {
         _flatten = flatten;
         _pathLine = pathLine;
         _indexFile = indexFile;
-        _prefixCtor = new PrefixConstructor(_originalPath);
+        prefixCtor = new PrefixConstructor(_originalPath);
         convert();
     }
 
@@ -54,18 +56,18 @@ public class Converter {
             return;
         }
 
-        try {
-            if (Files.isDirectory(_originalPath)) {
-                convertDirWithIndex(_originalPath);
-                return;
-            }
+        if (Files.isDirectory(_originalPath)) {
+            convertDirWithIndex(_originalPath);
+            return;
+        }
 
+        try {
             if (isCsv(_originalPath)) {
                 convertCsv(_originalPath);
                 return;
             }
-        } catch (ConvertException e) {
-            e.printStackTrace();
+        } catch (ConvertException | IOException e) {
+            errorReporter.addError(e);
             return;
         }
 
@@ -74,20 +76,21 @@ public class Converter {
 
     /**
      * Convert all <i>csv</i> files in given folder and its subfolders and generating index file.
+     *
      * @param directory {@code Path} to original directory
-     * @throws ConvertException if any file being converted has syntax error
      */
-    private void convertDirWithIndex(Path directory) throws ConvertException {
+    private void convertDirWithIndex(Path directory) {
         convertDir(directory);
         if (_flatten && _indexFile) createIndexFile();
+        createErrorFile();
     }
 
     /**
      * Convert all <i>csv</i> files in given folder and its subfolders.
+     *
      * @param directory {@code Path} to original directory
-     * @throws ConvertException if any file being converted has syntax error
      */
-    private void convertDir(Path directory) throws ConvertException {
+    private void convertDir(Path directory) {
 
         try (Stream<Path> walk = Files.walk(directory)) {
 
@@ -95,24 +98,34 @@ public class Converter {
                     .filter(Files::isRegularFile)
                     .filter(this::isCsv)
                     .sorted()
+                    .sorted((o1, o2) -> {
+                        if (o1.getNameCount() > o2.getNameCount()) return 1;
+                        else if (o1.getNameCount() < o2.getNameCount()) return -1;
+                        return o1.toString().compareTo(o2.toString());
+                    })
                     .collect(Collectors.toList());
 
             for (Path path : files) {
-                convertCsv(path);
+                try {
+                    convertCsv(path);
+                } catch (ConvertException e) {
+                    errorReporter.addError(e);
+                }
             }
         } catch (IOException e) {
-            e.printStackTrace();
+            errorReporter.addError(e);
         }
     }
 
     /**
      * Convert given <i>csv</i> file to <i>txt</i> file.
+     *
      * @param original {@code Path} to original file
      * @throws ConvertException if the line being converted has syntax errors
      */
-    private void convertCsv(Path original) throws ConvertException {
+    private void convertCsv(Path original) throws ConvertException, IOException {
 
-        int lineIndex = 0;
+        int lineIndex = 1;
         String line = "";
 
         // Init file reader
@@ -122,7 +135,7 @@ public class Converter {
             Path result;
             Path relative = _originalPath.relativize(original.getParent());
             if (_flatten) {
-                result = _resultPath.resolve(Paths.get(_prefixCtor.getPrefix(original) + ".txt"));
+                result = _resultPath.resolve(Paths.get(prefixCtor.getPrefix(original) + ".txt"));
             } else {
                 Path folder = _resultPath.resolve(_originalPath.relativize(original.getParent()));
                 Files.createDirectories(folder);
@@ -139,12 +152,12 @@ public class Converter {
                 Pattern dataStart = Pattern.compile("^(.*,)*indent,(.*,)*text,?(.*,?)*$");
                 int indentIndex = -1;
                 int textIndex = -1;
+                int parsedLineSize = -1;
 
                 // Write Path line
                 if (_pathLine) txtWriter.write(relative.toString() + '\n');
 
                 while (line != null) {
-                    lineIndex++;
 
                     if (skipFlag) {
 
@@ -155,11 +168,21 @@ public class Converter {
                             List<String> parsedLine = Arrays.asList(line.split(","));
                             indentIndex = parsedLine.indexOf("indent");
                             textIndex = parsedLine.indexOf("text");
+                            parsedLineSize = parsedLine.size();
                         }
+                        lineIndex++;
                     } else {
                         String tabs;
                         String text;
                         List<String> parsedLine = parseLine(line);
+                        int lineCount = 1;
+
+                        // Collect all lines with entry
+                        while (parsedLine.size() != parsedLineSize) {
+                            lineCount++;
+                            line += '\n' + csvReader.readLine();
+                            parsedLine = parseLine(line);
+                        }
 
                         // Nesting level
                         tabs = tabs(Integer.parseInt(parsedLine.get(indentIndex)));
@@ -169,6 +192,8 @@ public class Converter {
 
                         // Write to result file
                         txtWriter.write(tabs + text + '\n');
+
+                        lineIndex += lineCount;
                     }
 
                     // Next line
@@ -179,13 +204,12 @@ public class Converter {
             throw new ConvertException(original, lineIndex, line);
         } catch (FileNotFoundException e) {
             System.out.println("Wrong path " + _originalPath);
-        } catch (IOException e) {
-            e.printStackTrace();
         }
     }
 
     /**
      * Splits String with {@literal ,} delimiter with a quote (delimiter is ignored inside quotes).
+     *
      * @param line string to process
      * @return separated line
      */
@@ -206,22 +230,33 @@ public class Converter {
             return result;
         }
 
+        if (quotes.size() % 2 == 1) {
+            return Collections.emptyList();
+        }
+
         // Removing delimiters inside quote pairs
-        int j = 0;
+        int temp = 0;
+
         for (int i = 0; i < quotes.size() - 1; i += 2) {
             int quote1 = quotes.get(i);
             int quote2 = quotes.get(i + 1);
 
-            int comaIndex = comas.get(j);
-            while (comaIndex < quote1) comaIndex = comas.get(++j);
-            while (comaIndex < quote2) {
-                comas.remove(j);
-                comaIndex = comas.get(j);
+            for (int j = temp; j < comas.size(); j++) {
+                temp = j;
+                if (comas.get(j) > quote1) break;
+            }
+
+            int comaIndex = comas.get(temp);
+
+            while (comaIndex > quote1 && comaIndex < quote2) {
+                comas.remove(temp);
+                if (temp >= comas.size()) break;
+                comaIndex = comas.get(temp);
             }
         }
 
         // Splitting with remaining delimiters
-        j = 0;
+        int j = 0;
         for (int i : comas) {
             result.add(line.substring(j, i));
             j = i + 1;
@@ -243,6 +278,7 @@ public class Converter {
 
     /**
      * Checks if the file format is <i>csv</i>.
+     *
      * @param path {@code Path} to the file to check
      * @return has file <i>csv</i> extension
      */
@@ -263,7 +299,21 @@ public class Converter {
                 _resultPath.resolve("index.txt"),
                 Charset.forName("Cp866"))
         ) {
-            writer.write(_prefixCtor.getIndexPath());
+            writer.write(prefixCtor.getIndexPath());
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    /**
+     * Generating file with error messages.
+     */
+    private void createErrorFile() {
+        try (BufferedWriter writer = Files.newBufferedWriter(
+                _resultPath.resolve("errors.txt"),
+                Charset.forName("Cp866"))
+        ) {
+            writer.write(errorReporter.getReport());
         } catch (IOException e) {
             e.printStackTrace();
         }
