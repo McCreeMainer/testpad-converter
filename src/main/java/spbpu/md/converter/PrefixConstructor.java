@@ -61,7 +61,7 @@ public class PrefixConstructor {
             );
 
             if (nextFolder == null) {
-                nextFolder = new Folder(relativePath, folder.getInnerIndex());
+                nextFolder = new Folder(path, folder.getInnerIndex());
                 folder.addSubFolder(nextFolder);
             }
 
